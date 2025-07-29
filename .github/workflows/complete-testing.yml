@@ -1,0 +1,162 @@
+name: Complete Testing Pipeline
+
+on:
+  push:
+    branches: [ main, release-* ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * *'  # Nightly at 2 AM UTC
+  workflow_dispatch:
+    inputs:
+      run_chaos_tests:
+        description: 'Run chaos tests'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  GO_VERSION: '1.23'
+  KIND_VERSION: 'v0.26.0'
+  CHAOS_MESH_VERSION: 'latest'
+
+jobs:
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Install Kind
+      run: |
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+    
+    - name: Create Kind cluster
+      run: |
+        kind create cluster --config development/vllm/kind-config.yaml
+        kubectl cluster-info
+    
+    - name: Install ZMQ
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libzmq3-dev pkg-config
+    
+    - name: Build and load images
+      run: |
+        make docker-build-all
+        echo "Loading controller-manager image..."
+        kind load docker-image aibrix/controller-manager:nightly
+        echo "Loading gateway-plugins image..."
+        kind load docker-image aibrix/gateway-plugins:nightly
+        echo "Loading metadata-service image..."
+        kind load docker-image aibrix/metadata-service:nightly
+        echo "Loading runtime image..."
+        kind load docker-image aibrix/runtime:nightly
+        echo "Loading kvcache-watcher image..."
+        kind load docker-image aibrix/kvcache-watcher:nightly
+    
+    - name: Deploy AIBrix
+      run: |
+        kubectl apply -k config/dependency --server-side
+        kubectl apply -k config/test
+        
+        # Wait for Redis to be ready first as it's a dependency for E2E tests
+        echo "Waiting for Redis to be ready..."
+        kubectl wait --for=condition=ready pod -l app=redis,role=master -n aibrix-system --timeout=300s
+        
+        # Wait for controller-manager
+        kubectl wait --for=condition=ready pod -l control-plane=controller-manager -n aibrix-system --timeout=300s
+        
+        # Show pod status for debugging
+        echo "Pod status in aibrix-system namespace:"
+        kubectl get pods -n aibrix-system
+    
+    - name: Build mock vLLM image
+      run: |
+        cd development/app
+        docker build -t aibrix/vllm-mock:nightly -f Dockerfile .
+        # Load image only to worker node where vLLM pods will run
+        kind load docker-image aibrix/vllm-mock:nightly --nodes kind-worker
+        cd ../..
+    
+    - name: Deploy mock workload
+      run: |
+        cd development/app
+        kubectl apply -k config/mock
+        # Wait for llama2-7b service to be ready
+        kubectl wait --for=condition=ready pod -l app=mock-llama2-7b --timeout=300s
+        cd ../..
+    
+    - name: Setup port-forwarding
+      run: |
+        # Setup port-forwarding for services required by E2E tests
+        echo "Setting up port-forwarding..."
+        kubectl port-forward svc/llama2-7b 8000:8000 >/tmp/llama-pf.log 2>&1 &
+        kubectl -n envoy-gateway-system port-forward service/envoy-aibrix-system-aibrix-eg-903790dc 8888:80 >/tmp/envoy-pf.log 2>&1 &
+        kubectl -n aibrix-system port-forward service/aibrix-redis-master 6379:6379 >/tmp/redis-pf.log 2>&1 &
+        
+        # Wait for port-forwards to establish
+        sleep 10
+        
+        # Test Redis connectivity
+        echo "Testing Redis connectivity..."
+        nc -zv 127.0.0.1 6379 || {
+          echo "ERROR: Cannot connect to Redis on 127.0.0.1:6379"
+          echo "Redis port-forward log:"
+          cat /tmp/redis-pf.log || true
+          exit 1
+        }
+        echo "Redis is accessible on 127.0.0.1:6379"
+    
+    - name: Run E2E tests
+      run: |
+        export KUBECONFIG="${HOME}/.kube/config"
+        # Run KV sync E2E tests from the package to include all helper files
+        # Use zmq build tag since KV cache functionality requires ZMQ
+        go test -v -tags="zmq" ./test/e2e -run "TestKVSync" -timeout 30m
+    
+    - name: Collect logs on failure
+      if: failure()
+      run: |
+        kubectl get pods --all-namespaces
+        kubectl logs -n aibrix-system -l app.kubernetes.io/name=controller-manager --tail=100
+        kubectl logs -n kv-sync-test --all-containers=true --tail=100 || true
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        kind delete cluster
+
+
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests, e2e-tests, performance-tests, chaos-tests]
+    if: always() && github.event_name == 'schedule'
+    steps:
+    - name: Determine status
+      id: status
+      run: |
+        if [ "${{ needs.unit-tests.result }}" != "success" ] || \
+           [ "${{ needs.integration-tests.result }}" != "success" ] || \
+           [ "${{ needs.e2e-tests.result }}" != "success" ]; then
+          echo "status=failure" >> $GITHUB_OUTPUT
+        else
+          echo "status=success" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Notify on failure
+      if: steps.status.outputs.status == 'failure'
+      run: |
+        echo "Tests failed! Notification would be sent here."
+        # Add Slack/email notification logic here
