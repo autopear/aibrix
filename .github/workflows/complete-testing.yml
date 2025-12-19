@@ -1,142 +1,158 @@
-name: Complete Testing Pipeline
+name: Reproduce KV Event Sync Issue (#1720)
 
 on:
-  workflow_dispatch:  # Allows manual trigger
-  push:
+  workflow_dispatch:
   pull_request:
 
 env:
   GO_VERSION: '1.23'
   KIND_VERSION: 'v0.26.0'
-  CHAOS_MESH_VERSION: 'latest'
 
 jobs:
-  e2e-tests:
-    name: E2E Tests
+  kv-event-repro:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+
     steps:
     - uses: actions/checkout@v4
-    
+
+    # ------------------------------------------------------------
+    # TOOLING
+    # ------------------------------------------------------------
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          curl \
+          jq \
+          netcat-openbsd \
+          libzmq3-dev \
+          pkg-config \
+          libkrb5-dev
+
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
         go-version: ${{ env.GO_VERSION }}
-    
-    - name: Install Kind
-      run: |
-        curl -Lo ./kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
-        chmod +x ./kind
-        sudo mv ./kind /usr/local/bin/kind
-    
-    - name: Move Docker storage
-      run: |
-        sudo systemctl stop docker
-        sudo mkdir -p /mnt/docker-data
-        sudo chown root:root /mnt/docker-data
-        echo '{"data-root":"/mnt/docker-data"}' | sudo tee /etc/docker/daemon.json
-        sudo systemctl start docker
-        docker info | grep "Docker Root Dir"
 
-    - name: Cleanup Docker (free disk space)
+    - name: Install kind
       run: |
-        docker system prune -af --volumes
+        curl -Lo kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+        chmod +x kind
+        sudo mv kind /usr/local/bin/kind
 
-    - name: Create Kind cluster
+    # ------------------------------------------------------------
+    # CLUSTER
+    # ------------------------------------------------------------
+    - name: Create kind cluster
       run: |
         kind create cluster --config development/vllm/kind-config.yaml
         kubectl cluster-info
-        kind get clusters
-        kind get nodes
 
-    - name: Install ZMQ
+    - name: Create required namespaces
       run: |
-        sudo apt-get update
-        sudo apt-get install -y libzmq3-dev pkg-config libkrb5-dev
-        sudo apt-get clean -y
-        sudo apt-get autoclean -y
-    
-    - name: Build and load images
+        kubectl create namespace aibrix-system --dry-run=client -o yaml | kubectl apply -f -
+        kubectl create namespace envoy-gateway-system --dry-run=client -o yaml | kubectl apply -f -
+
+    # ------------------------------------------------------------
+    # BUILD + LOAD IMAGES
+    # ------------------------------------------------------------
+    - name: Build and load AIBrix images
       run: |
         make docker-build-all
-        echo "Loading controller-manager image..."
-        kind load docker-image aibrix/controller-manager:nightly
-        echo "Loading gateway-plugins image..."
-        kind load docker-image aibrix/gateway-plugins:nightly
-        echo "Loading metadata-service image..."
-        kind load docker-image aibrix/metadata-service:nightly
-        echo "Loading runtime image..."
         kind load docker-image aibrix/runtime:nightly
-        echo "Loading kvcache-watcher image..."
+        kind load docker-image aibrix/controller-manager:nightly
+        kind load docker-image aibrix/gateway-plugins:nightly
+        kind load docker-image aibrix/metadata-service:nightly
         kind load docker-image aibrix/kvcache-watcher:nightly
-    
-    - name: Deploy AIBrix
+
+    - name: Load vLLM CPU environment image
       run: |
-        kubectl apply -k config/dependency --server-side
-        kubectl apply -k config/test
-        
-        # Wait for Redis to be ready first as it's a dependency for E2E tests
-        echo "Waiting for Redis to be ready..."
-        kubectl wait --for=condition=ready pod -l app=redis,role=master -n aibrix-system --timeout=300s
-        
-        # Wait for controller-manager
-        kubectl wait --for=condition=ready pod -l control-plane=controller-manager -n aibrix-system --timeout=300s
-        
-        # Show pod status for debugging
-        echo "Pod status in aibrix-system namespace:"
-        kubectl get pods -n aibrix-system
-    
-    - name: Build mock vLLM image
+        docker pull aibrix/vllm-cpu-env:linux-amd64
+        kind load docker-image aibrix/vllm-cpu-env:linux-amd64
+
+    # ------------------------------------------------------------
+    # DEPLOY vLLM (REAL, CPU)
+    # ------------------------------------------------------------
+    - name: Deploy real vLLM CPU (facebook/opt-125m)
       run: |
-        cd development/app
-        docker build -t aibrix/vllm-mock:nightly -f Dockerfile .
-        # Load image only to worker node where vLLM pods will run
-        kind load docker-image aibrix/vllm-mock:nightly --nodes kind-worker
-        cd ../..
-    
-    - name: Deploy mock workload
+        kubectl create -k development/vllm/linux
+
+        kubectl wait --for=condition=ready pod \
+          -l app=facebook-opt-125m \
+          -n default \
+          --timeout=600s
+
+        kubectl get pods -n default -l app=facebook-opt-125m
+
+    # ------------------------------------------------------------
+    # DEPLOY AIBRIX
+    # ------------------------------------------------------------
+    - name: Deploy AIBrix components
       run: |
-        cd development/app
-        kubectl apply -k config/mock
-        # Wait for llama2-7b service to be ready
-        kubectl wait --for=condition=ready pod -l app=mock-llama2-7b --timeout=300s
-        cd ../..
-    
-    - name: Setup port-forwarding
+        kubectl create -k config/dependency
+        kubectl create -k config/default
+
+        kubectl wait --for=condition=ready pod \
+          -l app=redis,role=master \
+          -n aibrix-system \
+          --timeout=300s
+
+        kubectl wait --for=condition=ready pod \
+          -l control-plane=controller-manager \
+          -n aibrix-system \
+          --timeout=300s
+
+    # ------------------------------------------------------------
+    # ENABLE KV EVENTS
+    # ------------------------------------------------------------
+    - name: Enable KV event sync
       run: |
-        # Setup port-forwarding for services required by E2E tests
-        echo "Setting up port-forwarding..."
-        kubectl port-forward svc/llama2-7b 8000:8000 >/tmp/llama-pf.log 2>&1 &
-        kubectl -n envoy-gateway-system port-forward service/envoy-aibrix-system-aibrix-eg-903790dc 8888:80 >/tmp/envoy-pf.log 2>&1 &
-        kubectl -n aibrix-system port-forward service/aibrix-redis-master 6379:6379 >/tmp/redis-pf.log 2>&1 &
-        
-        # Wait for port-forwards to establish
+        kubectl set env deployment/aibrix-gateway-plugins -n aibrix-system \
+          AIBRIX_KV_EVENT_SYNC_ENABLED=true
+
+        kubectl rollout status deployment/aibrix-gateway-plugins -n aibrix-system
+
+    - name: Label vLLM pod for KV events
+      run: |
+        VLLM_POD=$(kubectl get pods -n default \
+          -l app=facebook-opt-125m \
+          -o jsonpath='{.items[0].metadata.name}')
+
+        kubectl label pod "${VLLM_POD}" \
+          model.aibrix.ai/kv-events-enabled="true" \
+          --overwrite
+
+    # ------------------------------------------------------------
+    # REPRODUCE ISSUE #1720
+    # ------------------------------------------------------------
+    - name: Reproduce KV-event sync issue
+      run: |
+        kubectl -n envoy-gateway-system \
+          port-forward svc/envoy-aibrix-system-aibrix-eg-903790dc 8888:80 \
+          >/tmp/envoy.log 2>&1 &
+
         sleep 10
-        
-        # Test Redis connectivity
-        echo "Testing Redis connectivity..."
-        nc -zv 127.0.0.1 6379 || {
-          echo "ERROR: Cannot connect to Redis on 127.0.0.1:6379"
-          echo "Redis port-forward log:"
-          cat /tmp/redis-pf.log || true
-          exit 1
-        }
-        echo "Redis is accessible on 127.0.0.1:6379"
-    
-    - name: Run E2E tests
-      run: |
-        export KUBECONFIG="${HOME}/.kube/config"
-        # Run KV sync E2E tests from the package to include all helper files
-        # Use zmq build tag since KV cache functionality requires ZMQ
-        go test -v -tags="zmq" ./test/e2e -run "TestKVSync" -timeout 30m
-    
-    - name: Collect logs on failure
-      if: failure()
-      run: |
-        kubectl get pods --all-namespaces
-        kubectl logs -n aibrix-system -l app.kubernetes.io/name=controller-manager --tail=100
-        kubectl logs -n kv-sync-test --all-containers=true --tail=100 || true
-    
+
+        echo "Sending inference request through gateway"
+        curl -s -X POST http://127.0.0.1:8888/v1/completions \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer test-key-1234567890" \
+          -d '{
+            "model": "facebook-opt-125m",
+            "prompt": "Once upon a time,",
+            "max_tokens": 32
+          }' | jq .
+
+        echo
+        echo "Gateway logs (BUG PRESENT => errors below)"
+        kubectl logs -n aibrix-system \
+          deployment/aibrix-gateway-plugins \
+          --tail=200
+
+    # ------------------------------------------------------------
+    # CLEANUP
+    # ------------------------------------------------------------
     - name: Cleanup
       if: always()
       run: |
