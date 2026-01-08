@@ -1,0 +1,159 @@
+name: Reproduce KV Event Sync Issue (#1720)
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+env:
+  GO_VERSION: '1.23'
+  KIND_VERSION: 'v0.26.0'
+
+jobs:
+  kv-event-repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # ------------------------------------------------------------
+    # TOOLING
+    # ------------------------------------------------------------
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          curl \
+          jq \
+          netcat-openbsd \
+          libzmq3-dev \
+          pkg-config \
+          libkrb5-dev
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Install kind
+      run: |
+        curl -Lo kind https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64
+        chmod +x kind
+        sudo mv kind /usr/local/bin/kind
+
+    # ------------------------------------------------------------
+    # CLUSTER
+    # ------------------------------------------------------------
+    - name: Create kind cluster
+      run: |
+        kind create cluster --config development/vllm/kind-config.yaml
+        kubectl cluster-info
+
+    - name: Create required namespaces
+      run: |
+        kubectl create namespace aibrix-system --dry-run=client -o yaml | kubectl apply -f -
+        kubectl create namespace envoy-gateway-system --dry-run=client -o yaml | kubectl apply -f -
+
+    # ------------------------------------------------------------
+    # BUILD + LOAD IMAGES
+    # ------------------------------------------------------------
+    - name: Build and load AIBrix images
+      run: |
+        make docker-build-all
+        kind load docker-image aibrix/runtime:nightly
+        kind load docker-image aibrix/controller-manager:nightly
+        kind load docker-image aibrix/gateway-plugins:nightly
+        kind load docker-image aibrix/metadata-service:nightly
+        kind load docker-image aibrix/kvcache-watcher:nightly
+
+    - name: Load vLLM CPU environment image
+      run: |
+        docker pull aibrix/vllm-cpu-env:linux-amd64
+        kind load docker-image aibrix/vllm-cpu-env:linux-amd64
+
+    # ------------------------------------------------------------
+    # DEPLOY vLLM (REAL, CPU)
+    # ------------------------------------------------------------
+    - name: Deploy real vLLM CPU (facebook/opt-125m)
+      run: |
+        kubectl create -k development/vllm/linux
+
+        kubectl wait --for=condition=ready pod \
+          -l app=facebook-opt-125m \
+          -n default \
+          --timeout=600s
+
+        kubectl get pods -n default -l app=facebook-opt-125m
+
+    # ------------------------------------------------------------
+    # DEPLOY AIBRIX
+    # ------------------------------------------------------------
+    - name: Deploy AIBrix components
+      run: |
+        kubectl create -k config/dependency
+        kubectl create -k config/default
+
+        kubectl wait --for=condition=ready pod \
+          -l app=redis,role=master \
+          -n aibrix-system \
+          --timeout=300s
+
+        kubectl wait --for=condition=ready pod \
+          -l control-plane=controller-manager \
+          -n aibrix-system \
+          --timeout=300s
+
+    # ------------------------------------------------------------
+    # ENABLE KV EVENTS
+    # ------------------------------------------------------------
+    - name: Enable KV event sync
+      run: |
+        kubectl set env deployment/aibrix-gateway-plugins -n aibrix-system \
+          AIBRIX_KV_EVENT_SYNC_ENABLED=true
+
+        kubectl rollout status deployment/aibrix-gateway-plugins -n aibrix-system
+
+    - name: Label vLLM pod for KV events
+      run: |
+        VLLM_POD=$(kubectl get pods -n default \
+          -l app=facebook-opt-125m \
+          -o jsonpath='{.items[0].metadata.name}')
+
+        kubectl label pod "${VLLM_POD}" \
+          model.aibrix.ai/kv-events-enabled="true" \
+          --overwrite
+
+    # ------------------------------------------------------------
+    # REPRODUCE ISSUE #1720
+    # ------------------------------------------------------------
+    - name: Reproduce KV-event sync issue
+      run: |
+        kubectl -n envoy-gateway-system \
+          port-forward svc/envoy-aibrix-system-aibrix-eg-903790dc 8888:80 \
+          >/tmp/envoy.log 2>&1 &
+
+        sleep 10
+
+        echo "Sending inference request through gateway"
+        curl -s -X POST http://127.0.0.1:8888/v1/completions \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer test-key-1234567890" \
+          -d '{
+            "model": "facebook-opt-125m",
+            "prompt": "Once upon a time,",
+            "max_tokens": 32
+          }' | jq .
+
+        echo
+        echo "Gateway logs (BUG PRESENT => errors below)"
+        kubectl logs -n aibrix-system \
+          deployment/aibrix-gateway-plugins \
+          --tail=200
+
+    # ------------------------------------------------------------
+    # CLEANUP
+    # ------------------------------------------------------------
+    - name: Cleanup
+      if: always()
+      run: |
+        kind delete cluster
