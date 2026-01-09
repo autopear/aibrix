@@ -16,7 +16,7 @@ require (
 	github.com/onsi/gomega v1.35.1
 	github.com/open-policy-agent/cert-controller v0.12.0
 	github.com/openai/openai-go v1.12.0
-	github.com/pebbe/zmq4 v1.2.10
+	github.com/pebbe/zmq4 v1.4.0
 	github.com/pkoukk/tiktoken-go v0.1.7
 	github.com/pkoukk/tiktoken-go-loader v0.0.1
 	github.com/prometheus/client_golang v1.20.2
@@ -24,10 +24,11 @@ require (
 	github.com/prometheus/common v0.55.0
 	github.com/ray-project/kuberay/ray-operator v1.2.1
 	github.com/redis/go-redis/v9 v9.6.1
-	github.com/shamaton/msgpack/v2 v2.1.1
 	github.com/stretchr/testify v1.10.0
+	github.com/vmihailenco/msgpack/v5 v5.4.1
 	go.uber.org/atomic v1.11.0
 	google.golang.org/grpc v1.65.0
+	google.golang.org/protobuf v1.35.1
 	k8s.io/api v0.31.8
 	k8s.io/apiextensions-apiserver v0.31.8
 	k8s.io/apimachinery v0.31.8
@@ -91,6 +92,7 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
+	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
@@ -106,7 +108,6 @@ require (
 	golang.org/x/tools v0.24.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.4.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240701130421-f6361c86f094 // indirect
-	google.golang.org/protobuf v1.35.1 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.12.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect

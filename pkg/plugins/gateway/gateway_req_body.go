@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"strconv"
 
-	"k8s.io/klog/v2"
-
 	configPb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	envoyTypePb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
+
+	"github.com/vllm-project/aibrix/pkg/constants"
 	routing "github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms"
 	"github.com/vllm-project/aibrix/pkg/types"
 	"github.com/vllm-project/aibrix/pkg/utils"
@@ -39,10 +41,28 @@ func (s *Server) HandleRequestBody(ctx context.Context, requestID string, req *e
 	routingAlgorithm := routingCtx.Algorithm
 
 	body := req.Request.(*extProcPb.ProcessingRequest_RequestBody)
-	model, message, stream, errRes := validateRequestBody(requestID, requestPath, body.RequestBody.GetBody(), user)
-	if errRes != nil {
-		return errRes, model, routingCtx, stream, term
+
+	var model, message string
+	var stream bool
+	var errRes *extProcPb.ProcessingResponse
+
+	// Check if this is a multipart request (audio endpoints)
+	contentType := routingCtx.ReqHeaders[contentTypeKey]
+	if isAudioRequest(requestPath) && isMultipartRequest(contentType) {
+		// Parse multipart form data for audio endpoints
+		model, stream, errRes = parseMultipartFormData(requestID, contentType, body.RequestBody.GetBody())
+		if errRes != nil {
+			return errRes, model, routingCtx, stream, term
+		}
+		message = "" // Audio requests don't have a text message for token counting
+	} else {
+		// Use existing JSON validation for other endpoints
+		model, message, stream, errRes = validateRequestBody(requestID, requestPath, body.RequestBody.GetBody(), user)
+		if errRes != nil {
+			return errRes, model, routingCtx, stream, term
+		}
 	}
+
 	routingCtx.Model = model
 	routingCtx.Message = message
 	routingCtx.ReqBody = body.RequestBody.GetBody()
@@ -67,6 +87,14 @@ func (s *Server) HandleRequestBody(ctx context.Context, requestID string, req *e
 	}
 
 	headers := []*configPb.HeaderValueOption{}
+
+	// Path rewriting for image/video generation based on engine type
+	// xdit engine uses /generate and /generatevideo endpoints
+	// vllm/vllm-omni uses OpenAI-compatible /v1/images/generations
+	if rewritePath := getEngineBasedPathRewrite(requestPath, podsArr.All()); rewritePath != "" {
+		headers = buildEnvoyProxyHeaders(headers, ":path", rewritePath)
+	}
+
 	if routingAlgorithm == routing.RouterNotSet {
 		if err := s.validateHTTPRouteStatus(ctx, model); err != nil {
 			return buildErrorResponse(envoyTypePb.StatusCode_ServiceUnavailable, err.Error(), ErrorCodeServiceUnavailable, "", HeaderErrorRouting, "true"), model, routingCtx, stream, term
@@ -111,4 +139,33 @@ func (s *Server) HandleRequestBody(ctx context.Context, requestID string, req *e
 			},
 		},
 	}, model, routingCtx, stream, term
+}
+
+// getEngineBasedPathRewrite returns the rewritten path for image/video generation endpoints
+// based on the engine type specified in the pod labels/annotations.
+// Returns empty string if no rewrite is needed (e.g., for vllm/vllm-omni which uses OpenAI-compatible paths).
+func getEngineBasedPathRewrite(requestPath string, pods []*v1.Pod) string {
+	if len(pods) == 0 {
+		return ""
+	}
+
+	// Get engine type from the first pod (all pods for a model should have the same engine)
+	pod := pods[0]
+	engine := pod.Labels[constants.ModelLabelEngine]
+	if engine == "" {
+		engine = pod.Annotations[constants.ModelLabelEngine]
+	}
+
+	// Only xdit engine needs path rewriting to its native endpoints
+	if engine == EngineXdit {
+		switch requestPath {
+		case PathImagesGenerations:
+			return PathXditGenerate
+		case PathVideoGenerations:
+			return PathXditGenerateVideo
+		}
+	}
+
+	// vllm, vllm-omni, sglang, and other engines use OpenAI-compatible paths
+	return ""
 }
